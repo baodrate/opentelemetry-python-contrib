@@ -1,11 +1,14 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 
+# pylint: disable=too-many-lines
+
 import unittest
 from timeit import default_timer
 from unittest.mock import patch
 
 from starlette import applications
+from starlette.middleware import Middleware
 from starlette.responses import PlainTextResponse
 from starlette.routing import Host, Mount, Route
 from starlette.testclient import TestClient
@@ -20,17 +23,23 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.semconv._incubating.attributes.http_attributes import (
     HTTP_FLAVOR,
     HTTP_ROUTE,
+    HTTP_STATUS_CODE,
     HTTP_TARGET,
     HTTP_URL,
+)
+from opentelemetry.semconv.attributes.exception_attributes import (
+    EXCEPTION_TYPE,
 )
 from opentelemetry.test.globals_test import reset_trace_globals
 from opentelemetry.test.test_base import TestBase
 from opentelemetry.trace import (
     NoOpTracerProvider,
     SpanKind,
+    get_current_span,
     get_tracer,
     set_tracer_provider,
 )
+from opentelemetry.trace.status import StatusCode
 from opentelemetry.util.http import (
     OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SANITIZE_FIELDS,
     OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SERVER_REQUEST,
@@ -405,8 +414,9 @@ class TestAutoInstrumentation(TestStarletteManualInstrumentation):
 
     def test_manual_instrument_is_noop(self):
         app = self._create_starlette_app()
+        build_middleware_stack = app.build_middleware_stack
         self._instrumentor.instrument_app(app)
-        self.assertEqual(len(app.user_middleware), 1)
+        self.assertIs(app.build_middleware_stack, build_middleware_stack)
         client = TestClient(app)
         client.get("/foobar")
         spans = self.memory_exporter.get_finished_spans()
@@ -553,6 +563,189 @@ class TestAutoInstrumentationHooks(TestStarletteManualInstrumentationHooks):
             "http://testserver/sub/home",
             server_span.attributes[HTTP_URL],
         )
+
+
+class UnhandledException(Exception):
+    pass
+
+
+class _RaisingMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        raise UnhandledException("Test Exception")
+
+
+class TestTraceableExceptionHandling(TestBase):
+    """Tests to ensure Starlette exception handlers are only executed once and with a valid context"""
+
+    def setUp(self):
+        super().setUp()
+        self._instrumentor = otel_starlette.StarletteInstrumentor()
+        self._app = None
+        self.executed = 0
+        self.request_trace_id = None
+        self.error_trace_id = None
+
+    def tearDown(self):
+        super().tearDown()
+        if self._app is not None:
+            with self.disable_logging():
+                self._instrumentor.uninstrument_app(self._app)
+
+    def _create_client(
+        self, routes, exception_handlers=None, middleware=None
+    ):
+        self._app = applications.Starlette(
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+        )
+        self._instrumentor.instrument_app(self._app)
+        return TestClient(self._app)
+
+    def _get_server_span(self):
+        spans = self.memory_exporter.get_finished_spans()
+        server_spans = [
+            span for span in spans if span.kind == SpanKind.SERVER
+        ]
+        self.assertEqual(len(server_spans), 1)
+        return server_spans[0]
+
+    def test_error_handler_context(self):
+        """OTEL tracing contexts must be available during error handler
+        execution, and handlers must only be executed once"""
+
+        status_code = 501
+
+        async def _error_handler(*_):
+            self.error_trace_id = (
+                get_current_span().get_span_context().trace_id
+            )
+            self.executed += 1
+            return PlainTextResponse("", status_code)
+
+        async def _foobar(_):
+            self.request_trace_id = (
+                get_current_span().get_span_context().trace_id
+            )
+            raise UnhandledException("Test Exception")
+
+        client = self._create_client(
+            [Route("/foobar", _foobar)],
+            exception_handlers={Exception: _error_handler},
+        )
+
+        try:
+            client.get("/foobar")
+        except UnhandledException:
+            pass
+
+        self.assertIsNotNone(self.request_trace_id)
+        self.assertEqual(self.request_trace_id, self.error_trace_id)
+
+        span = self._get_server_span()
+        self.assertEqual(span.name, "GET /foobar")
+        self.assertEqual(span.attributes.get(HTTP_STATUS_CODE), status_code)
+        self.assertEqual(span.status.status_code, StatusCode.ERROR)
+        self.assertEqual(len(span.events), 1)
+        event = span.events[0]
+        self.assertEqual(event.name, "exception")
+        self.assertEqual(
+            event.attributes.get(EXCEPTION_TYPE),
+            f"{__name__}.UnhandledException",
+        )
+        self.assertEqual(self.executed, 1)
+
+    def test_exception_span_recording(self):
+        """Exceptions are always recorded in the active span"""
+
+        async def _foobar(_):
+            raise UnhandledException("Test Exception")
+
+        client = self._create_client([Route("/foobar", _foobar)])
+
+        try:
+            client.get("/foobar")
+        except UnhandledException:
+            pass
+
+        span = self._get_server_span()
+        self.assertEqual(span.name, "GET /foobar")
+        self.assertEqual(span.attributes.get(HTTP_STATUS_CODE), 500)
+        self.assertEqual(span.status.status_code, StatusCode.ERROR)
+        self.assertEqual(len(span.events), 1)
+        event = span.events[0]
+        self.assertEqual(event.name, "exception")
+        self.assertEqual(
+            event.attributes.get(EXCEPTION_TYPE),
+            f"{__name__}.UnhandledException",
+        )
+
+    def test_middleware_exceptions(self):
+        """Exceptions from user middlewares are recorded in the active span"""
+
+        async def _foobar(_):
+            return PlainTextResponse("Hello World")
+
+        client = self._create_client(
+            [Route("/foobar", _foobar)],
+            middleware=[Middleware(_RaisingMiddleware)],
+        )
+
+        try:
+            client.get("/foobar")
+        except UnhandledException:
+            pass
+
+        span = self._get_server_span()
+        self.assertEqual(span.name, "GET /foobar")
+        self.assertEqual(span.attributes.get(HTTP_STATUS_CODE), 500)
+        self.assertEqual(span.status.status_code, StatusCode.ERROR)
+        self.assertEqual(len(span.events), 1)
+        event = span.events[0]
+        self.assertEqual(event.name, "exception")
+        self.assertEqual(
+            event.attributes.get(EXCEPTION_TYPE),
+            f"{__name__}.UnhandledException",
+        )
+
+
+class TestStarletteFallback(TestBase):
+    def test_no_instrumentation_on_unexpected_middleware_stack(self):
+        def _home(_):
+            return PlainTextResponse("hi")
+
+        app = applications.Starlette(routes=[Route("/foobar", _home)])
+        # Return something that is NOT a ServerErrorMiddleware so the
+        # instrumentation fallback path triggers while requests are still
+        # served by the plain router.
+        app.build_middleware_stack = lambda: app.router
+
+        instrumentor = otel_starlette.StarletteInstrumentor()
+        with self.assertLogs(
+            "opentelemetry.instrumentation.starlette", level="ERROR"
+        ) as log_context:
+            instrumentor.instrument_app(app)
+            client = TestClient(app)
+            resp = client.get("/foobar")
+
+        self.assertEqual(200, resp.status_code)
+
+        spans = self.memory_exporter.get_finished_spans()
+        self.assertEqual(len(spans), 0)
+
+        self.assertEqual(len(log_context.records), 1)
+        self.assertIn(
+            "Skipping Starlette instrumentation due to unexpected middleware stack: expected ServerErrorMiddleware",
+            log_context.records[0].getMessage(),
+        )
+
+        instrumentor.uninstrument_app(app)
 
 
 class TestAutoInstrumentationLogic(unittest.TestCase):

@@ -1,0 +1,1 @@
+`opentelemetry-instrumentation-starlette`: make trace context available in exception handlers and record exceptions raised in user middlewares

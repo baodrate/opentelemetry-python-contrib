@@ -165,11 +165,16 @@ API
 
 from __future__ import annotations
 
+import functools
+import logging
+import types
 from typing import TYPE_CHECKING, Any, Collection, cast
 from weakref import WeakSet
 
 from starlette import applications
+from starlette.middleware.errors import ServerErrorMiddleware
 from starlette.routing import Match
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
 from opentelemetry.instrumentation.asgi.types import (
@@ -184,7 +189,12 @@ from opentelemetry.metrics import MeterProvider, get_meter
 from opentelemetry.semconv._incubating.attributes.http_attributes import (
     HTTP_ROUTE,
 )
-from opentelemetry.trace import TracerProvider, get_tracer
+from opentelemetry.trace import (
+    TracerProvider,
+    get_current_span,
+    get_tracer,
+)
+from opentelemetry.trace.status import Status, StatusCode
 from opentelemetry.util.http import get_excluded_urls
 
 if TYPE_CHECKING:
@@ -199,6 +209,7 @@ if TYPE_CHECKING:
 
 
 _excluded_urls = get_excluded_urls("STARLETTE")
+_logger = logging.getLogger(__name__)
 
 
 class StarletteInstrumentor(BaseInstrumentor):
@@ -246,17 +257,119 @@ class StarletteInstrumentor(BaseInstrumentor):
             schema_url="https://opentelemetry.io/schemas/1.11.0",
         )
         if not getattr(app, "_is_instrumented_by_opentelemetry", False):
-            app.add_middleware(
-                OpenTelemetryMiddleware,
-                excluded_urls=_excluded_urls,
-                default_span_details=_get_default_span_details,
-                server_request_hook=server_request_hook,
-                client_request_hook=client_request_hook,
-                client_response_hook=client_response_hook,
-                # Pass in tracer/meter to get __name__and __version__ of starlette instrumentation
-                tracer=tracer,
-                meter=meter,
+            # capture the value at instrumentation time to freeze the
+            # configuration used by the lazily built middleware stack
+            excluded_urls = _excluded_urls
+
+            def build_middleware_stack(self: applications.Starlette) -> ASGIApp:
+                # Define an additional middleware for exception handling
+                # Normally, `opentelemetry.trace.use_span` covers the recording of
+                # exceptions into the active span, but `OpenTelemetryMiddleware`
+                # ends the span too early before the exception can be recorded.
+                class ExceptionHandlerMiddleware:
+                    def __init__(self, app: ASGIApp):
+                        self.app = app
+
+                    async def __call__(
+                        self, scope: Scope, receive: Receive, send: Send
+                    ) -> None:
+                        try:
+                            await self.app(scope, receive, send)
+                        except Exception as exc:  # pylint: disable=broad-exception-caught
+                            span = get_current_span()
+                            if span.is_recording():
+                                span.record_exception(exc)
+                                span.set_status(
+                                    Status(
+                                        status_code=StatusCode.ERROR,
+                                        description=f"{type(exc).__name__}: {exc}",
+                                    )
+                                )
+                            raise
+
+                # For every possible use case of error handling, exception
+                # handling, trace availability in exception handlers and
+                # automatic exception recording to work, we need to make a
+                # series of wrapping and re-wrapping middlewares.
+
+                # First, grab the original middleware stack from Starlette. It
+                # comprises a stack of
+                # `ServerErrorMiddleware` -> [user defined middlewares] -> `ExceptionMiddleware`
+                inner_server_error_middleware = (
+                    self._original_build_middleware_stack()
+                )
+
+                if not isinstance(
+                    inner_server_error_middleware, ServerErrorMiddleware
+                ):
+                    # Oops, something changed about how Starlette creates middleware stacks
+                    _logger.error(
+                        "Skipping Starlette instrumentation due to unexpected middleware stack: expected %s, got %s",
+                        ServerErrorMiddleware.__name__,
+                        type(inner_server_error_middleware),
+                    )
+                    return inner_server_error_middleware
+
+                # We take [user defined middlewares] -> `ExceptionMiddleware`
+                # out of the outermost `ServerErrorMiddleware` and instead pass
+                # it to our own `ExceptionHandlerMiddleware`
+                exception_middleware = ExceptionHandlerMiddleware(
+                    inner_server_error_middleware.app
+                )
+
+                # Now, we create a new `ServerErrorMiddleware` that wraps
+                # `ExceptionHandlerMiddleware` but otherwise uses the same
+                # original `handler` and debug setting. The end result is a
+                # middleware stack that's identical to the original stack except
+                # all user middlewares are covered by our
+                # `ExceptionHandlerMiddleware`.
+                error_middleware = ServerErrorMiddleware(
+                    app=exception_middleware,
+                    handler=inner_server_error_middleware.handler,
+                    debug=inner_server_error_middleware.debug,
+                )
+
+                # Finally, we wrap the stack above in our actual OTEL
+                # middleware. As a result, an active tracing context exists for
+                # every use case of user-defined error and exception handlers as
+                # well as automatic recording of exceptions in active spans.
+                otel_middleware = OpenTelemetryMiddleware(
+                    error_middleware,
+                    excluded_urls=excluded_urls,
+                    default_span_details=_get_default_span_details,
+                    server_request_hook=server_request_hook,
+                    client_request_hook=client_request_hook,
+                    client_response_hook=client_response_hook,
+                    # Pass in tracer/meter to get __name__and __version__ of starlette instrumentation
+                    tracer=tracer,
+                    meter=meter,
+                )
+
+                # Ultimately, wrap everything in another default
+                # `ServerErrorMiddleware` (w/o user handlers) so that any
+                # exceptions raised in `OpenTelemetryMiddleware` are handled.
+                #
+                # This should not happen unless there is a bug in
+                # OpenTelemetryMiddleware, but if there is we don't want that to
+                # impact the user's application just because we wrapped the
+                # middlewares in this order.
+                return ServerErrorMiddleware(
+                    app=otel_middleware,
+                )
+
+            app._original_build_middleware_stack = app.build_middleware_stack
+            app.build_middleware_stack = types.MethodType(
+                functools.wraps(app.build_middleware_stack)(
+                    build_middleware_stack
+                ),
+                app,
             )
+            # Starlette < 0.28 builds the middleware stack eagerly in
+            # `Starlette.__init__`, so it has to be rebuilt for the wrapped
+            # `build_middleware_stack` to take effect.
+            if app.middleware_stack is not None:
+                app.middleware_stack = app.build_middleware_stack()
+
             app._is_instrumented_by_opentelemetry = True
 
             # adding apps to set for uninstrumenting
@@ -264,12 +377,16 @@ class StarletteInstrumentor(BaseInstrumentor):
 
     @staticmethod
     def uninstrument_app(app: applications.Starlette):
-        app.user_middleware = [
-            x
-            for x in app.user_middleware
-            if x.cls is not OpenTelemetryMiddleware
-        ]
-        app.middleware_stack = app.build_middleware_stack()
+        original_build_middleware_stack = getattr(
+            app, "_original_build_middleware_stack", None
+        )
+        if original_build_middleware_stack:
+            app.build_middleware_stack = original_build_middleware_stack
+            del app._original_build_middleware_stack
+        # only rebuild an already built middleware stack; rebuilding a lazily
+        # built stack would prevent adding middlewares afterwards
+        if app.middleware_stack is not None:
+            app.middleware_stack = app.build_middleware_stack()
         app._is_instrumented_by_opentelemetry = False
 
     def instrumentation_dependencies(self) -> Collection[str]:
@@ -309,32 +426,14 @@ class _InstrumentedStarlette(applications.Starlette):
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
-        tracer = get_tracer(
-            __name__,
-            __version__,
-            _InstrumentedStarlette._tracer_provider,
-            schema_url="https://opentelemetry.io/schemas/1.11.0",
-        )
-        meter = get_meter(
-            __name__,
-            __version__,
-            _InstrumentedStarlette._meter_provider,
-            schema_url="https://opentelemetry.io/schemas/1.11.0",
-        )
-        self.add_middleware(
-            OpenTelemetryMiddleware,
-            excluded_urls=_excluded_urls,
-            default_span_details=_get_default_span_details,
+        StarletteInstrumentor.instrument_app(
+            self,
             server_request_hook=_InstrumentedStarlette._server_request_hook,
             client_request_hook=_InstrumentedStarlette._client_request_hook,
             client_response_hook=_InstrumentedStarlette._client_response_hook,
-            # Pass in tracer/meter to get __name__and __version__ of starlette instrumentation
-            tracer=tracer,
-            meter=meter,
+            meter_provider=_InstrumentedStarlette._meter_provider,
+            tracer_provider=_InstrumentedStarlette._tracer_provider,
         )
-        self._is_instrumented_by_opentelemetry = True
-        # adding apps to set for uninstrumenting
-        _InstrumentedStarlette._instrumented_starlette_apps.add(self)
 
 
 def _get_route_details(scope: dict[str, Any]) -> str | None:
